@@ -18,6 +18,7 @@ OBJS = \
 	heapam_visibility.o \
 	heaptoast.o \
 	hio.o \
+	muadb_storage.o \
 	pruneheap.o \
 	rewriteheap.o \
 	vacuumlazy.o \

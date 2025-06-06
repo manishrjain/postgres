@@ -71,6 +71,7 @@
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+#include "muadb_storage.h"
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
@@ -2055,6 +2056,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	RelationPutHeapTuple(relation, buffer, heaptup,
 						 (options & HEAP_INSERT_SPECULATIVE) != 0);
 
+	/* Store in MUADB */
+	muadb_store_tuple(relation, heaptup);
+
 	if (PageIsAllVisible(BufferGetPage(buffer)))
 	{
 		all_visible_cleared = true;
@@ -2956,6 +2960,8 @@ l1:
 							  &new_xmax, &new_infomask, &new_infomask2);
 
 	START_CRIT_SECTION();
+
+	muadb_remove_tuple(relation, tid);
 
 	/*
 	 * If this transaction commits, the tuple will become DEAD sooner or
