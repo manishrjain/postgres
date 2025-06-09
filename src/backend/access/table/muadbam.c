@@ -36,6 +36,22 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
+/* 
+ * MuaDB Logging Configuration
+ * Set MUADB_ENABLE_LOGGING to 1 to enable logging, 0 to disable
+ */
+#define MUADB_ENABLE_LOGGING 0
+
+#if MUADB_ENABLE_LOGGING
+#define MUADB_LOG(...) \
+	do { \
+		if (CritSectionCount == 0 && !IsBootstrapProcessingMode()) \
+			elog(LOG, __VA_ARGS__); \
+	} while (0)
+#else
+#define MUADB_LOG(...) ((void)0)
+#endif
+
 /* Function prototype for handler */
 Datum muadb_tableam_handler(PG_FUNCTION_ARGS);
 
@@ -65,8 +81,7 @@ typedef struct MuadbScanDescData *MuadbScanDesc;
 static const TupleTableSlotOps *
 muadbam_slot_callbacks(Relation relation)
 {
-	elog(LOG, "MuaDB: Getting slot callbacks for relation %s", 
-		 RelationGetRelationName(relation));
+	MUADB_LOG("MuaDB: operation");
 	
 	/*
 	 * For now, we'll use the same slot callbacks as heap.
@@ -87,8 +102,7 @@ muadbam_scan_begin(Relation relation, Snapshot snapshot,
 {
 	MuadbScanDesc scan;
 	
-	elog(LOG, "MuaDB: Beginning scan of relation %s (OID: %u)", 
-		 RelationGetRelationName(relation), RelationGetRelid(relation));
+	MUADB_LOG("MuaDB: operation");
 
 	scan = (MuadbScanDesc) palloc0(sizeof(MuadbScanDescData));
 	
@@ -112,7 +126,7 @@ muadbam_scan_end(TableScanDesc scan)
 {
 	MuadbScanDesc muadb_scan = (MuadbScanDesc) scan;
 	
-	elog(LOG, "MuaDB: Ending scan of relation %s", 
+	MUADB_LOG("MuaDB: Ending scan of relation %s", 
 		 RelationGetRelationName(scan->rs_rd));
 	
 	pfree(muadb_scan);
@@ -124,7 +138,7 @@ muadbam_scan_rescan(TableScanDesc scan, ScanKey key, bool set_params,
 {
 	MuadbScanDesc muadb_scan = (MuadbScanDesc) scan;
 	
-	elog(LOG, "MuaDB: Rescanning relation %s", 
+	MUADB_LOG("MuaDB: Rescanning relation %s", 
 		 RelationGetRelationName(scan->rs_rd));
 	
 	/* Reset scan state */
@@ -142,7 +156,7 @@ muadbam_scan_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTable
 {
 	MuadbScanDesc muadb_scan = (MuadbScanDesc) scan;
 	
-	elog(LOG, "MuaDB: Getting next slot from relation %s", 
+	MUADB_LOG("MuaDB: Getting next slot from relation %s", 
 		 RelationGetRelationName(scan->rs_rd));
 	
 	/* For now, just return false (no tuples found) */
@@ -164,10 +178,15 @@ muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	bool shouldFree = true;
 	HeapTuple tuple;
 	
-	elog(LOG, "MuaDB: Inserting tuple into relation %s (OID: %u) - "
-		 "cid=%u, options=0x%x",
-		 RelationGetRelationName(relation), RelationGetRelid(relation),
-		 cid, options);
+
+	/* During bootstrap, just delegate to heap without our custom logic */
+	if (IsBootstrapProcessingMode())
+	{
+		/* Get the heap table access method and call its tuple_insert */
+		const TableAmRoutine *heap_tam = GetHeapamTableAmRoutine();
+		heap_tam->tuple_insert(relation, slot, cid, options, bistate);
+		return;
+	}
 
 	/*
 	 * For now, we'll delegate to heap for basic functionality.
@@ -187,9 +206,7 @@ muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	heap_insert(relation, tuple, cid, options, bistate);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
 	
-	elog(LOG, "MuaDB: Successfully inserted tuple at TID (%u,%u)",
-		 ItemPointerGetBlockNumber(&slot->tts_tid),
-		 ItemPointerGetOffsetNumber(&slot->tts_tid));
+	MUADB_LOG("MuaDB: operation");
 
 	if (shouldFree)
 		pfree(tuple);
@@ -203,7 +220,7 @@ muadbam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 	bool shouldFree = true;
 	HeapTuple tuple;
 	
-	elog(LOG, "MuaDB: Speculative insert into relation %s (token: %u)", 
+	MUADB_LOG("MuaDB: Speculative insert into relation %s (token: %u)", 
 		 RelationGetRelationName(relation), specToken);
 	
 	/* Delegate to regular heap for now */
@@ -226,7 +243,7 @@ static void
 muadbam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 									uint32 specToken, bool succeeded)
 {
-	elog(LOG, "MuaDB: Completing speculative insert (token: %u, succeeded: %s)", 
+	MUADB_LOG("MuaDB: Completing speculative insert (token: %u, succeeded: %s)", 
 		 specToken, succeeded ? "true" : "false");
 	
 	/* Delegate to heap for now */
@@ -241,7 +258,7 @@ muadbam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 					 Snapshot snapshot, Snapshot crosscheck, bool wait,
 					 TM_FailureData *tmfd, bool changingPart)
 {
-	elog(LOG, "MuaDB: Deleting tuple from relation %s at TID (%u,%u)", 
+	MUADB_LOG("MuaDB: Deleting tuple from relation %s at TID (%u,%u)", 
 		 RelationGetRelationName(relation),
 		 ItemPointerGetBlockNumber(tid),
 		 ItemPointerGetOffsetNumber(tid));
@@ -260,7 +277,7 @@ muadbam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	HeapTuple tuple;
 	TM_Result result;
 	
-	elog(LOG, "MuaDB: Updating tuple in relation %s at TID (%u,%u)", 
+	MUADB_LOG("MuaDB: Updating tuple in relation %s at TID (%u,%u)", 
 		 RelationGetRelationName(relation),
 		 ItemPointerGetBlockNumber(otid),
 		 ItemPointerGetOffsetNumber(otid));
@@ -293,7 +310,7 @@ muadbam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	HeapTuple tuple;
 	bool follow_updates;
 	
-	elog(LOG, "MuaDB: Locking tuple in relation %s at TID (%u,%u)", 
+	MUADB_LOG("MuaDB: Locking tuple in relation %s at TID (%u,%u)", 
 		 RelationGetRelationName(relation),
 		 ItemPointerGetBlockNumber(tid),
 		 ItemPointerGetOffsetNumber(tid));
@@ -334,7 +351,7 @@ muadbam_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 {
 	int i;
 	
-	elog(LOG, "MuaDB: Multi-inserting %d tuples into relation %s", 
+	MUADB_LOG("MuaDB: Multi-inserting %d tuples into relation %s", 
 		 nslots, RelationGetRelationName(rel));
 	
 	/* For now, just call single insert multiple times */
@@ -370,7 +387,7 @@ muadbam_index_fetch_begin(Relation rel)
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Beginning index fetch for relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Beginning index fetch for relation %s", RelationGetRelationName(rel));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -392,7 +409,7 @@ muadbam_index_fetch_end(IndexFetchTableData *scan)
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Ending index fetch");
+	MUADB_LOG("MuaDB: Ending index fetch");
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -405,7 +422,7 @@ muadbam_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Fetching tuple via index at TID (%u,%u)",
+	MUADB_LOG("MuaDB: Fetching tuple via index at TID (%u,%u)",
 		 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 	
 	/* Get heap table access method and delegate */
@@ -418,7 +435,7 @@ muadbam_fetch_row_version(Relation relation, ItemPointer tid, Snapshot snapshot,
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Fetching row version from relation %s at TID (%u,%u)",
+	MUADB_LOG("MuaDB: Fetching row version from relation %s at TID (%u,%u)",
 		 RelationGetRelationName(relation),
 		 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 	
@@ -430,7 +447,7 @@ muadbam_fetch_row_version(Relation relation, ItemPointer tid, Snapshot snapshot,
 static void 
 muadbam_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
-	elog(LOG, "MuaDB: Getting latest TID for relation %s", RelationGetRelationName(scan->rs_rd));
+	MUADB_LOG("MuaDB: Getting latest TID for relation %s", RelationGetRelationName(scan->rs_rd));
 	
 	/* Delegate to heap */
 	heap_get_latest_tid(scan, tid);
@@ -459,7 +476,7 @@ muadbam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot sn
 static TransactionId 
 muadbam_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
-	elog(LOG, "MuaDB: Index delete tuples for relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Index delete tuples for relation %s", RelationGetRelationName(rel));
 	
 	/* Delegate to heap */
 	return heap_index_delete_tuples(rel, delstate);
@@ -471,7 +488,7 @@ muadbam_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrloc
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Setting new filelocator for relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Setting new filelocator for relation %s", RelationGetRelationName(rel));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -483,7 +500,7 @@ muadbam_relation_nontransactional_truncate(Relation rel)
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Non-transactional truncate of relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Non-transactional truncate of relation %s", RelationGetRelationName(rel));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -495,7 +512,7 @@ muadbam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Copying data for relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Copying data for relation %s", RelationGetRelationName(rel));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -510,7 +527,7 @@ muadbam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap, Relation O
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Copying for cluster from %s to %s", 
+	MUADB_LOG("MuaDB: Copying for cluster from %s to %s", 
 		 RelationGetRelationName(OldHeap), RelationGetRelationName(NewHeap));
 	
 	/* Get heap table access method and delegate */
@@ -522,7 +539,7 @@ muadbam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap, Relation O
 static void 
 muadbam_relation_vacuum(Relation rel, struct VacuumParams *params, BufferAccessStrategy bstrategy)
 {
-	elog(LOG, "MuaDB: Vacuuming relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Vacuuming relation %s", RelationGetRelationName(rel));
 	
 	/* Delegate to heap */
 	heap_vacuum_rel(rel, params, bstrategy);
@@ -533,7 +550,7 @@ muadbam_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Analyze next block for relation %s", RelationGetRelationName(scan->rs_rd));
+	MUADB_LOG("MuaDB: Analyze next block for relation %s", RelationGetRelationName(scan->rs_rd));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -559,7 +576,7 @@ muadbam_index_build_range_scan(Relation heapRelation, Relation indexRelation, In
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Index build range scan for relation %s", RelationGetRelationName(heapRelation));
+	MUADB_LOG("MuaDB: Index build range scan for relation %s", RelationGetRelationName(heapRelation));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -573,7 +590,7 @@ muadbam_index_validate_scan(Relation heapRelation, Relation indexRelation, Index
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Index validate scan for relation %s", RelationGetRelationName(heapRelation));
+	MUADB_LOG("MuaDB: Index validate scan for relation %s", RelationGetRelationName(heapRelation));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -583,7 +600,7 @@ muadbam_index_validate_scan(Relation heapRelation, Relation indexRelation, Index
 static uint64 
 muadbam_relation_size(Relation rel, ForkNumber forkNumber)
 {
-	elog(LOG, "MuaDB: Getting relation size for %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Getting relation size for %s", RelationGetRelationName(rel));
 	
 	/* Delegate to heap */
 	return table_block_relation_size(rel, forkNumber);
@@ -592,7 +609,7 @@ muadbam_relation_size(Relation rel, ForkNumber forkNumber)
 static bool 
 muadbam_relation_needs_toast_table(Relation rel)
 {
-	elog(LOG, "MuaDB: Checking if relation %s needs TOAST table", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Checking if relation %s needs TOAST table", RelationGetRelationName(rel));
 	
 	/* We disabled TOAST, so always return false */
 	return false;
@@ -601,7 +618,7 @@ muadbam_relation_needs_toast_table(Relation rel)
 static Oid 
 muadbam_relation_toast_am(Relation rel)
 {
-	elog(LOG, "MuaDB: Getting TOAST AM for relation %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Getting TOAST AM for relation %s", RelationGetRelationName(rel));
 	
 	/* Since we don't use TOAST, return InvalidOid */
 	return InvalidOid;
@@ -611,7 +628,7 @@ static void
 muadbam_relation_fetch_toast_slice(Relation toastrel, Oid valueid, int32 attrsize,
 									int32 sliceoffset, int32 slicelength, struct varlena *result)
 {
-	elog(ERROR, "MuaDB: TOAST not supported - should not be called");
+	MUADB_LOG("MuaDB: TOAST not supported - should not be called");
 }
 
 static void 
@@ -620,7 +637,7 @@ muadbam_estimate_rel_size(Relation rel, int32 *attr_widths, BlockNumber *pages,
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Estimating relation size for %s", RelationGetRelationName(rel));
+	MUADB_LOG("MuaDB: Estimating relation size for %s", RelationGetRelationName(rel));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -632,7 +649,7 @@ muadbam_scan_bitmap_next_block(TableScanDesc scan, struct TBMIterateResult *tbmr
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Bitmap scan next block for relation %s", RelationGetRelationName(scan->rs_rd));
+	MUADB_LOG("MuaDB: Bitmap scan next block for relation %s", RelationGetRelationName(scan->rs_rd));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -654,7 +671,7 @@ muadbam_scan_sample_next_block(TableScanDesc scan, struct SampleScanState *scans
 {
 	const TableAmRoutine *heapam;
 	
-	elog(LOG, "MuaDB: Sample scan next block for relation %s", RelationGetRelationName(scan->rs_rd));
+	MUADB_LOG("MuaDB: Sample scan next block for relation %s", RelationGetRelationName(scan->rs_rd));
 	
 	/* Get heap table access method and delegate */
 	heapam = GetHeapamTableAmRoutine();
@@ -741,5 +758,9 @@ static const TableAmRoutine muadbam_methods = {
 Datum
 muadb_tableam_handler(PG_FUNCTION_ARGS)
 {
+	/* During bootstrap, return NULL to let PostgreSQL use the default heap AM */
+	if (IsBootstrapProcessingMode())
+		PG_RETURN_NULL();
+		
 	PG_RETURN_POINTER(&muadbam_methods);
 } 
