@@ -40,7 +40,7 @@
  * MuaDB Logging Configuration
  * Set MUADB_ENABLE_LOGGING to 1 to enable logging, 0 to disable
  */
-#define MUADB_ENABLE_LOGGING 0
+#define MUADB_ENABLE_LOGGING 1
 
 #if MUADB_ENABLE_LOGGING
 #define MUADB_LOG(...) \
