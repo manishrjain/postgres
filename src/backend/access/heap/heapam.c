@@ -73,7 +73,6 @@
 #include "utils/syscache.h"
 
 
-
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, int options);
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
@@ -2023,26 +2022,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * into the relation; tup is the caller's original untoasted data.
 	 */
 	heaptup = heap_prepare_insert(relation, tup, xid, cid, options);
-
-	/*
-	 * We're about to do the actual insert -- but check for conflict first, to
-	 * avoid possibly having to roll back work we've just done.
-	 *
-	 * This is safe without a recheck as long as there is no possibility of
-	 * another process scanning the page between this check and the insert
-	 * being visible to the scan (i.e., an exclusive buffer content lock is
-	 * continuously held from this point until the tuple insert is visible).
-	 *
-	 * For a heap insert, we only need to check for table-level SSI locks. Our
-	 * new tuple can't possibly conflict with existing tuple locks, and heap
-	 * page locks are only consolidated versions of tuple locks; they do not
-	 * lock "gaps" as index page locks do.  So we don't need to specify a
-	 * buffer when making the call, which makes for a faster check.
-	 */
-	CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber);
-
-	/* NO EREPORT(ERROR) from here till changes are logged */
-	START_CRIT_SECTION();
 
 	/*
 	 * Find buffer to insert this tuple into.  If the page is all visible,
