@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	muadbam.o \
 	table.o \
 	tableam.o \
 	tableamapi.o \
