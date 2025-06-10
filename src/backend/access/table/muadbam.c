@@ -36,6 +36,9 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
+/* Redis integration */
+#include <hiredis/hiredis.h>
+
 /* 
  * MuaDB Logging Configuration
  * Set MUADB_ENABLE_LOGGING to 1 to enable logging, 0 to disable
@@ -52,8 +55,55 @@
 #define MUADB_LOG(...) ((void)0)
 #endif
 
-/* Function prototype for handler */
+/* Redis connection management */
+static redisContext *muadb_redis_ctx = NULL;
+
+/*
+ * Connect to Redis server
+ */
+static redisContext *
+muadb_connect_redis(void)
+{
+	redisContext *ctx;
+	
+	if (muadb_redis_ctx != NULL && muadb_redis_ctx->err == 0)
+		return muadb_redis_ctx;
+	
+	/* Connect to Redis on localhost:6379 */
+	ctx = redisConnect("127.0.0.1", 6379);
+	if (ctx == NULL || ctx->err) {
+		if (ctx) {
+			MUADB_LOG("MuaDB Redis connection error: %s", ctx->errstr);
+			redisFree(ctx);
+		} else {
+			MUADB_LOG("MuaDB Redis connection error: can't allocate redis context");
+		}
+		return NULL;
+	}
+	
+	muadb_redis_ctx = ctx;
+	MUADB_LOG("MuaDB: Successfully connected to Redis");
+	return ctx;
+}
+
+/*
+ * Disconnect from Redis server
+ */
+static void
+muadb_disconnect_redis(void)
+{
+	if (muadb_redis_ctx != NULL) {
+		redisFree(muadb_redis_ctx);
+		muadb_redis_ctx = NULL;
+		MUADB_LOG("MuaDB: Disconnected from Redis");
+	}
+}
+
+/* Function prototypes */
 Datum muadb_tableam_handler(PG_FUNCTION_ARGS);
+static TM_Result muadbam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
+					 Snapshot snapshot, Snapshot crosscheck, bool wait,
+					 TM_FailureData *tmfd, bool changingPart);
 
 /* ----------------------------------------------------------------
  * MuaDB specific structures and declarations
@@ -175,41 +225,97 @@ static void
 muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 					 int options, BulkInsertState bistate)
 {
+	redisContext *redis_ctx;
+	redisReply *reply;
+	char *key_buffer;
+	char *value_buffer;
 	bool shouldFree = true;
 	HeapTuple tuple;
-	
+	Oid relation_oid;
+	static uint32 next_tuple_id = 1;
 
-	/* During bootstrap, just delegate to heap without our custom logic */
-	if (IsBootstrapProcessingMode())
-	{
-		/* Get the heap table access method and call its tuple_insert */
-		const TableAmRoutine *heap_tam = GetHeapamTableAmRoutine();
-		heap_tam->tuple_insert(relation, slot, cid, options, bistate);
+	/* During bootstrap, just do a minimal insert without Redis */
+	// if (IsBootstrapProcessingMode())
+	// {
+	// 	/* For bootstrap, just set a fake TID and return */
+	// 	BlockNumber blocknum = 1;
+	// 	OffsetNumber offnum = 1;
+	// 	ItemPointerSet(&slot->tts_tid, blocknum, offnum);
+	// 	slot->tts_tableOid = RelationGetRelid(relation);
+	// 	return;
+	// }
+
+	MUADB_LOG("MuaDB: Inserting tuple into relation %s using Redis", 
+		 RelationGetRelationName(relation));
+
+	/* Connect to Redis */
+	redis_ctx = muadb_connect_redis();
+	if (redis_ctx == NULL) {
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("MuaDB: Failed to connect to Redis server")));
 		return;
 	}
 
-	/*
-	 * For now, we'll delegate to heap for basic functionality.
-	 * In a real implementation, this would:
-	 * 1. Serialize the tuple to a key-value format
-	 * 2. Store it in MuaDB storage 
-	 * 3. Set the slot's TID to indicate where it was stored
-	 */
-	
+	/* Get tuple data */
 	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	relation_oid = RelationGetRelid(relation);
 	
-	/* Update the tuple with table oid */
-	slot->tts_tableOid = RelationGetRelid(relation);
-	tuple->t_tableOid = slot->tts_tableOid;
-
-	/* For now, use heap_insert but with MuaDB logging */
-	heap_insert(relation, tuple, cid, options, bistate);
-	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
+	/* 
+	 * Create a unique key for this tuple: "muadb:table_oid:tuple_id"
+	 * In a real implementation, you might use a more sophisticated key scheme
+	 */
+	key_buffer = psprintf("muadb:%u:%u", relation_oid, next_tuple_id);
 	
-	MUADB_LOG("MuaDB: operation");
-
+	/*
+	 * For simplicity, we'll store the tuple's raw data as binary.
+	 * In a real implementation, you'd probably want to serialize to JSON 
+	 * or a more structured format.
+	 */
+	value_buffer = (char *) tuple->t_data;
+	
+	/* Store in Redis using SET command */
+	reply = redisCommand(redis_ctx, "SET %s %b", key_buffer, 
+						 value_buffer, tuple->t_len);
+	
+	if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
+		if (reply) {
+			MUADB_LOG("MuaDB Redis SET error: %s", reply->str);
+			freeReplyObject(reply);
+		}
+		if (shouldFree)
+			pfree(tuple);
+		pfree(key_buffer);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("MuaDB: Failed to store tuple in Redis")));
+		return;
+	}
+	
+	MUADB_LOG("MuaDB: Successfully stored tuple with key '%s' in Redis", key_buffer);
+	
+	/* Generate a fake TID for the stored tuple */
+	BlockNumber blocknum;
+	OffsetNumber offnum;
+	
+	blocknum = (next_tuple_id / MaxOffsetNumber) + 1;
+	offnum = (next_tuple_id % MaxOffsetNumber) + 1;
+	ItemPointerSet(&slot->tts_tid, blocknum, offnum);
+	
+	/* Set the table OID */
+	slot->tts_tableOid = relation_oid;
+	tuple->t_tableOid = relation_oid;
+	
+	/* Increment tuple ID for next insertion */
+	next_tuple_id++;
+	
+	/* Cleanup */
+	freeReplyObject(reply);
+	pfree(key_buffer);
 	if (shouldFree)
 		pfree(tuple);
+	
+	MUADB_LOG("MuaDB: Tuple inserted with TID (%u,%u)", blocknum, offnum);
 }
 
 static void
@@ -217,26 +323,12 @@ muadbam_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 								  CommandId cid, int options,
 								  BulkInsertState bistate, uint32 specToken)
 {
-	bool shouldFree = true;
-	HeapTuple tuple;
-	
 	MUADB_LOG("MuaDB: Speculative insert into relation %s (token: %u)", 
 		 RelationGetRelationName(relation), specToken);
 	
-	/* Delegate to regular heap for now */
-	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-
-	slot->tts_tableOid = RelationGetRelid(relation);
-	tuple->t_tableOid = slot->tts_tableOid;
-
-	HeapTupleHeaderSetSpeculativeToken(tuple->t_data, specToken);
-	options |= HEAP_INSERT_SPECULATIVE;
-
-	heap_insert(relation, tuple, cid, options, bistate);
-	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
-
-	if (shouldFree)
-		pfree(tuple);
+	/* For MuaDB, we'll just do a regular insert for now */
+	/* In a real implementation, you'd handle speculative tokens properly */
+	muadbam_tuple_insert(relation, slot, cid, options, bistate);
 }
 
 static void
@@ -246,11 +338,15 @@ muadbam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 	MUADB_LOG("MuaDB: Completing speculative insert (token: %u, succeeded: %s)", 
 		 specToken, succeeded ? "true" : "false");
 	
-	/* Delegate to heap for now */
-	if (succeeded)
-		heap_finish_speculative(relation, &slot->tts_tid);
-	else
-		heap_abort_speculative(relation, &slot->tts_tid);
+	/* For MuaDB, speculative operations are simplified */
+	/* In a real implementation, you'd handle rollback of failed speculative inserts */
+	if (!succeeded) {
+		/* If the speculative insert failed, we should delete the tuple */
+		TM_FailureData tmfd;
+		muadbam_tuple_delete(relation, &slot->tts_tid, GetCurrentCommandId(false),
+							 NULL, NULL, false, &tmfd, false);
+	}
+	/* If succeeded, the tuple is already inserted, nothing more to do */
 }
 
 static TM_Result
@@ -258,13 +354,58 @@ muadbam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 					 Snapshot snapshot, Snapshot crosscheck, bool wait,
 					 TM_FailureData *tmfd, bool changingPart)
 {
-	MUADB_LOG("MuaDB: Deleting tuple from relation %s at TID (%u,%u)", 
-		 RelationGetRelationName(relation),
-		 ItemPointerGetBlockNumber(tid),
-		 ItemPointerGetOffsetNumber(tid));
+	redisContext *redis_ctx;
+	redisReply *reply;
+	char *key_buffer;
+	Oid relation_oid;
+	uint32 tuple_id;
+	BlockNumber blocknum;
+	OffsetNumber offnum;
 	
-	/* Delegate to heap for now */
-	return heap_delete(relation, tid, cid, crosscheck, wait, tmfd, changingPart);
+	blocknum = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
+	
+	MUADB_LOG("MuaDB: Deleting tuple from relation %s at TID (%u,%u)", 
+		 RelationGetRelationName(relation), blocknum, offnum);
+	
+	/* Connect to Redis */
+	redis_ctx = muadb_connect_redis();
+	if (redis_ctx == NULL) {
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("MuaDB: Failed to connect to Redis server")));
+		return TM_Deleted;
+	}
+	
+	/* Calculate the tuple ID from TID */
+	tuple_id = ((blocknum - 1) * MaxOffsetNumber) + (offnum - 1);
+	relation_oid = RelationGetRelid(relation);
+	
+	/* Create the key to delete */
+	key_buffer = psprintf("muadb:%u:%u", relation_oid, tuple_id);
+	
+	/* Delete from Redis using DEL command */
+	reply = redisCommand(redis_ctx, "DEL %s", key_buffer);
+	
+	if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
+		if (reply) {
+			MUADB_LOG("MuaDB Redis DEL error: %s", reply->str);
+			freeReplyObject(reply);
+		}
+		pfree(key_buffer);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("MuaDB: Failed to delete tuple from Redis")));
+		return TM_Deleted;
+	}
+	
+	MUADB_LOG("MuaDB: Successfully deleted tuple with key '%s' from Redis", key_buffer);
+	
+	/* Cleanup */
+	freeReplyObject(reply);
+	pfree(key_buffer);
+	
+	return TM_Ok;
 }
 
 static TM_Result
@@ -282,20 +423,21 @@ muadbam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 		 ItemPointerGetBlockNumber(otid),
 		 ItemPointerGetOffsetNumber(otid));
 	
-	/* Delegate to heap for now */
-	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-
-	slot->tts_tableOid = RelationGetRelid(relation);
-	tuple->t_tableOid = slot->tts_tableOid;
-
-	result = heap_update(relation, otid, tuple, cid, crosscheck, wait,
-						 tmfd, lockmode, update_indexes);
-	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
-
-	if (shouldFree)
-		pfree(tuple);
-
-	return result;
+	/* For MuaDB, we'll do a delete followed by insert */
+	/* First delete the old tuple */
+	TM_Result delete_result = muadbam_tuple_delete(relation, otid, cid, 
+												   crosscheck, crosscheck, wait, tmfd, false);
+	
+	if (delete_result != TM_Ok)
+		return delete_result;
+	
+	/* Then insert the new tuple */
+	muadbam_tuple_insert(relation, slot, cid, 0, NULL);
+	
+	/* Copy the new TID back to otid for the caller */
+	ItemPointerCopy(&slot->tts_tid, otid);
+	
+	return TM_Ok;
 }
 
 static TM_Result
@@ -315,30 +457,15 @@ muadbam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 		 ItemPointerGetBlockNumber(tid),
 		 ItemPointerGetOffsetNumber(tid));
 	
-	/* For now, delegate to heap - this is complex to implement from scratch */
-	bslot = (BufferHeapTupleTableSlot *) slot;
-	tuple = &bslot->base.tupdata;
-
-	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
-	tmfd->traversed = false;
-
-	Assert(TTS_IS_BUFFERTUPLE(slot));
-
-	tuple->t_self = *tid;
-	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
-							 follow_updates, &buffer, tmfd);
-
-	if (result == TM_Ok)
-	{
-		ExecStoreBufferHeapTuple(tuple, slot, buffer);
-	}
-	else
-	{
-		ExecClearTuple(slot);
-		ReleaseBuffer(buffer);
-	}
-
-	return result;
+	/* For MuaDB, locking is simplified - we'll just return success */
+	/* In a real implementation, you'd implement proper tuple locking */
+	
+	/* Set up the slot with a fake tuple */
+	ExecClearTuple(slot);
+	slot->tts_tableOid = RelationGetRelid(relation);
+	
+	/* For now, just return success */
+	return TM_Ok;
 }
 
 /* ----------------------------------------------------------------
@@ -449,8 +576,8 @@ muadbam_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
 	MUADB_LOG("MuaDB: Getting latest TID for relation %s", RelationGetRelationName(scan->rs_rd));
 	
-	/* Delegate to heap */
-	heap_get_latest_tid(scan, tid);
+	/* For MuaDB, TIDs don't change, so just return the same TID */
+	/* In a real implementation, you'd track TID changes */
 }
 
 static bool 
@@ -478,8 +605,8 @@ muadbam_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 	MUADB_LOG("MuaDB: Index delete tuples for relation %s", RelationGetRelationName(rel));
 	
-	/* Delegate to heap */
-	return heap_index_delete_tuples(rel, delstate);
+	/* For MuaDB, return InvalidTransactionId to indicate no cleanup needed */
+	return InvalidTransactionId;
 }
 
 static void 
@@ -541,8 +668,8 @@ muadbam_relation_vacuum(Relation rel, struct VacuumParams *params, BufferAccessS
 {
 	MUADB_LOG("MuaDB: Vacuuming relation %s", RelationGetRelationName(rel));
 	
-	/* Delegate to heap */
-	heap_vacuum_rel(rel, params, bstrategy);
+	/* For MuaDB, vacuum is a no-op since we use Redis for storage */
+	/* In a real implementation, you might clean up Redis keys */
 }
 
 static bool 
@@ -758,9 +885,6 @@ static const TableAmRoutine muadbam_methods = {
 Datum
 muadb_tableam_handler(PG_FUNCTION_ARGS)
 {
-	/* During bootstrap, return NULL to let PostgreSQL use the default heap AM */
-	if (IsBootstrapProcessingMode())
-		PG_RETURN_NULL();
-		
+	/* Always return our MuaDB methods */
 	PG_RETURN_POINTER(&muadbam_methods);
 } 

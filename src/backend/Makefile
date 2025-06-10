@@ -50,6 +50,9 @@ LIBS := $(filter-out -lpgport -lpgcommon, $(LIBS)) $(LDAP_LIBS_BE) $(ICU_LIBS)
 # The backend doesn't need everything that's in LIBS, however
 LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
 
+# Add Redis library for MuaDB
+LIBS += -lhiredis
+
 ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
