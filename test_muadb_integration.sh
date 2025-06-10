@@ -67,6 +67,10 @@ cleanup() {
     rm -rf "$DATA_DIR"
     rm -f "$LOG_FILE"
     
+    # Remove configure files to force reconfiguration
+    rm -f config.status config.log config.cache
+    rm -rf autom4te.cache || true
+    
     print_status "Cleanup completed."
 }
 
@@ -80,7 +84,28 @@ compile_postgres() {
     # Configure (if not already configured)
     if [ ! -f "config.status" ]; then
         print_status "Configuring PostgreSQL build..."
-        ./configure --prefix=/usr/local/pgsql --enable-debug --enable-cassert
+        # Check if we're on macOS and add hiredis paths
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # Try common homebrew locations
+            HIREDIS_PREFIX=""
+            if [ -d "/opt/homebrew/include/hiredis" ]; then
+                HIREDIS_PREFIX="/opt/homebrew"
+            elif [ -d "/usr/local/include/hiredis" ]; then
+                HIREDIS_PREFIX="/usr/local"
+            fi
+            
+            if [ -n "$HIREDIS_PREFIX" ]; then
+                print_status "Found hiredis at $HIREDIS_PREFIX"
+                ./configure --prefix=/usr/local/pgsql --enable-debug --enable-cassert \
+                    --with-includes="$HIREDIS_PREFIX/include" \
+                    --with-libraries="$HIREDIS_PREFIX/lib"
+            else
+                print_warning "hiredis not found in standard locations, trying default configure"
+                ./configure --prefix=/usr/local/pgsql --enable-debug --enable-cassert
+            fi
+        else
+            ./configure --prefix=/usr/local/pgsql --enable-debug --enable-cassert
+        fi
     fi
     
     # Compile
