@@ -136,13 +136,18 @@ static TM_Result muadbam_tuple_delete(Relation relation, ItemPointer tid, Comman
  * MuaDB scan descriptor - extends the base TableScanDesc
  */
 typedef struct MuadbScanDescData
-{
+{     
 	TableScanDescData rs_base;	/* Base scan descriptor */
 	
 	/* MuaDB specific scan state */
 	BlockNumber		muadb_current_block;
 	OffsetNumber	muadb_current_offset;
 	bool			muadb_scan_finished;
+	
+	/* Redis scan state */
+	char			**redis_keys;		/* Array of Redis keys for this relation */
+	int				redis_key_count;	/* Number of keys */
+	int				redis_current_key;	/* Current key index */
 } MuadbScanDescData;
 
 typedef struct MuadbScanDescData *MuadbScanDesc;
@@ -154,7 +159,7 @@ typedef struct MuadbScanDescData *MuadbScanDesc;
 static const TupleTableSlotOps *
 muadbam_slot_callbacks(Relation relation)
 {
-	MUADB_LOG("MuaDB: operation");
+	MUADB_LOG("MuaDB: muadbam_slot_callbacks for relation %s", RelationGetRelationName(relation));
 	
 	/*
 	 * For now, we'll use the same slot callbacks as heap.
@@ -174,8 +179,13 @@ muadbam_scan_begin(Relation relation, Snapshot snapshot,
 				   uint32 flags)
 {
 	MuadbScanDesc scan;
+	redisContext *redis_ctx;
+	redisReply *reply;
+	char *key_pattern;
+	Oid relation_oid;
+	int i;
 	
-	MUADB_LOG("MuaDB: operation");
+	MUADB_LOG("MuaDB: *** SCAN_BEGIN CALLED *** for relation %s", RelationGetRelationName(relation));
 
 	scan = (MuadbScanDesc) palloc0(sizeof(MuadbScanDescData));
 	
@@ -190,6 +200,45 @@ muadbam_scan_begin(Relation relation, Snapshot snapshot,
 	scan->muadb_current_block = 0;
 	scan->muadb_current_offset = FirstOffsetNumber;
 	scan->muadb_scan_finished = false;
+	
+	/* Initialize Redis scan state */
+	scan->redis_keys = NULL;
+	scan->redis_key_count = 0;
+	scan->redis_current_key = 0;
+	
+	/* Connect to Redis and get all keys for this relation */
+	redis_ctx = muadb_connect_redis();
+	if (redis_ctx != NULL) {
+		relation_oid = RelationGetRelid(relation);
+		key_pattern = psprintf("muadb:%u:*", relation_oid);
+		
+		MUADB_LOG("MuaDB: Searching for keys with pattern '%s'", key_pattern);
+		reply = redisCommand(redis_ctx, "KEYS %s", key_pattern);
+		if (reply != NULL && reply->type == REDIS_REPLY_ARRAY) {
+			scan->redis_key_count = reply->elements;
+			MUADB_LOG("MuaDB: KEYS command returned %d keys", scan->redis_key_count);
+			if (scan->redis_key_count > 0) {
+				scan->redis_keys = (char **) palloc(scan->redis_key_count * sizeof(char *));
+				for (i = 0; i < scan->redis_key_count; i++) {
+					scan->redis_keys[i] = pstrdup(reply->element[i]->str);
+					MUADB_LOG("MuaDB: Found key: %s", scan->redis_keys[i]);
+				}
+				MUADB_LOG("MuaDB: Found %d keys for relation %s", 
+						 scan->redis_key_count, RelationGetRelationName(relation));
+			}
+			freeReplyObject(reply);
+		} else {
+			MUADB_LOG("MuaDB: KEYS command failed or returned non-array result");
+		}
+		pfree(key_pattern);
+	} else {
+		MUADB_LOG("MuaDB: Failed to connect to Redis during scan_begin");
+	}
+	
+	if (scan->redis_key_count == 0) {
+		MUADB_LOG("MuaDB: No keys found for relation %s", RelationGetRelationName(relation));
+		scan->muadb_scan_finished = true;
+	}
 
 	return (TableScanDesc) scan;
 }
@@ -198,9 +247,18 @@ static void
 muadbam_scan_end(TableScanDesc scan)
 {
 	MuadbScanDesc muadb_scan = (MuadbScanDesc) scan;
+	int i;
 	
 	MUADB_LOG("MuaDB: Ending scan of relation %s", 
 		 RelationGetRelationName(scan->rs_rd));
+	
+	/* Free Redis keys */
+	if (muadb_scan->redis_keys != NULL) {
+		for (i = 0; i < muadb_scan->redis_key_count; i++) {
+			pfree(muadb_scan->redis_keys[i]);
+		}
+		pfree(muadb_scan->redis_keys);
+	}
 	
 	pfree(muadb_scan);
 }
@@ -217,7 +275,10 @@ muadbam_scan_rescan(TableScanDesc scan, ScanKey key, bool set_params,
 	/* Reset scan state */
 	muadb_scan->muadb_current_block = 0;
 	muadb_scan->muadb_current_offset = FirstOffsetNumber;
-	muadb_scan->muadb_scan_finished = false;
+	muadb_scan->muadb_scan_finished = (muadb_scan->redis_key_count == 0);
+	
+	/* Reset Redis scan state */
+	muadb_scan->redis_current_key = 0;
 	
 	/* Update scan keys if provided */
 	if (key != NULL)
@@ -228,16 +289,87 @@ static bool
 muadbam_scan_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 {
 	MuadbScanDesc muadb_scan = (MuadbScanDesc) scan;
+	redisContext *redis_ctx;
+	redisReply *reply;
+	HeapTupleData tuple_data;
+	HeapTuple tuple;
+	char *current_key;
+	uint32 tuple_id;
+	BlockNumber blocknum;
+	OffsetNumber offnum;
 	
 	MUADB_LOG("MuaDB: Getting next slot from relation %s", 
 		 RelationGetRelationName(scan->rs_rd));
 	
-	/* For now, just return false (no tuples found) */
-	/* In a real implementation, this would iterate through MuaDB storage */
-	ExecClearTuple(slot);
-	muadb_scan->muadb_scan_finished = true;
+	/* Check if scan is finished */
+	if (muadb_scan->muadb_scan_finished || 
+		muadb_scan->redis_current_key >= muadb_scan->redis_key_count) {
+		ExecClearTuple(slot);
+		return false;
+	}
 	
-	return false;
+	/* Connect to Redis */
+	redis_ctx = muadb_connect_redis();
+	if (redis_ctx == NULL) {
+		MUADB_LOG("MuaDB: Failed to connect to Redis during scan");
+		ExecClearTuple(slot);
+		muadb_scan->muadb_scan_finished = true;
+		return false;
+	}
+	
+	/* Get the current Redis key */
+	current_key = muadb_scan->redis_keys[muadb_scan->redis_current_key];
+	
+	/* Retrieve tuple data from Redis */
+	reply = redisCommand(redis_ctx, "GET %s", current_key);
+	if (reply == NULL || reply->type != REDIS_REPLY_STRING) {
+		MUADB_LOG("MuaDB: Failed to retrieve tuple data for key %s", current_key);
+		if (reply)
+			freeReplyObject(reply);
+		ExecClearTuple(slot);
+		muadb_scan->redis_current_key++;
+		return muadbam_scan_getnextslot(scan, direction, slot); /* Try next key */
+	}
+	
+	/* Extract tuple ID from key (format: "muadb:oid:tuple_id") */
+	if (sscanf(current_key, "muadb:%*u:%u", &tuple_id) != 1) {
+		MUADB_LOG("MuaDB: Invalid key format: %s", current_key);
+		freeReplyObject(reply);
+		ExecClearTuple(slot);
+		muadb_scan->redis_current_key++;
+		return muadbam_scan_getnextslot(scan, direction, slot); /* Try next key */
+	}
+	
+	/* Reconstruct HeapTuple from Redis data */
+	tuple_data.t_len = reply->len;
+	tuple_data.t_data = (HeapTupleHeader) reply->str;
+	tuple_data.t_tableOid = RelationGetRelid(scan->rs_rd);
+	
+	/* Calculate TID from tuple_id (same logic as insert) */
+	blocknum = (tuple_id / MaxOffsetNumber) + 1;
+	offnum = (tuple_id % MaxOffsetNumber) + 1;
+	ItemPointerSet(&tuple_data.t_self, blocknum, offnum);
+	
+	/* Create a copy of the tuple data since Redis reply will be freed */
+	tuple = heap_copytuple(&tuple_data);
+	
+	/* Store tuple in slot using the virtual tuple approach */
+	ExecForceStoreHeapTuple(tuple, slot, true); /* true = should free tuple */
+	slot->tts_tableOid = RelationGetRelid(scan->rs_rd);
+	
+	MUADB_LOG("MuaDB: Retrieved tuple with key %s, TID (%u,%u)", 
+			 current_key, blocknum, offnum);
+	
+	/* Clean up and advance to next key */
+	freeReplyObject(reply);
+	muadb_scan->redis_current_key++;
+	
+	/* Check if we've reached the end */
+	if (muadb_scan->redis_current_key >= muadb_scan->redis_key_count) {
+		muadb_scan->muadb_scan_finished = true;
+	}
+	
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -905,6 +1037,7 @@ static const TableAmRoutine muadbam_methods = {
 Datum
 muadb_tableam_handler(PG_FUNCTION_ARGS)
 {
+	MUADB_LOG("MuaDB: *** HANDLER CALLED *** returning muadbam_methods");
 	/* Always return our MuaDB methods */
 	PG_RETURN_POINTER(&muadbam_methods);
 } 
