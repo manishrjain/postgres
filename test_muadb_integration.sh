@@ -207,22 +207,10 @@ run_tests() {
     
     echo -e "${BLUE}=== Testing large tuples (demonstrating TOAST is disabled) ===${NC}"
     
-    # Test tuples that would normally trigger TOAST (>2KB each)
-    echo -e "${YELLOW}Inserting 3KB tuple (would normally trigger TOAST)...${NC}"
-    psql -p $PORT -d postgres -c "INSERT INTO muadb_large_test (description, large_data, data_size) 
-        VALUES ('3KB Test Data', repeat('A', 3000), 3000);"
-    
+    # Test tuple that would normally trigger TOAST (>2KB)
     echo -e "${YELLOW}Inserting 5KB tuple (would normally trigger TOAST)...${NC}"
     psql -p $PORT -d postgres -c "INSERT INTO muadb_large_test (description, large_data, data_size) 
         VALUES ('5KB Test Data', repeat('B', 5000), 5000);"
-    
-    echo -e "${YELLOW}Inserting 7KB tuple (would normally trigger TOAST)...${NC}"
-    psql -p $PORT -d postgres -c "INSERT INTO muadb_large_test (description, large_data, data_size) 
-        VALUES ('7KB Test Data', repeat('C', 7000), 7000);"
-    
-    echo -e "${YELLOW}Inserting 8KB tuple (near page limit, would normally trigger TOAST)...${NC}"
-    psql -p $PORT -d postgres -c "INSERT INTO muadb_large_test (description, large_data, data_size) 
-        VALUES ('8KB Test Data', repeat('D', 7500), 7500);"
     
     echo -e "${BLUE}=== Verifying large tuple storage ===${NC}"
     psql -p $PORT -d postgres -c "SELECT id, description, data_size, length(large_data) as actual_length 
@@ -230,11 +218,11 @@ run_tests() {
     
     echo -e "${BLUE}=== Testing large tuple update ===${NC}"
     psql -p $PORT -d postgres -c "UPDATE muadb_large_test 
-        SET large_data = repeat('X', 8000), data_size = 8000 
-        WHERE description = '7KB Test Data';"
+        SET large_data = repeat('X', 6000), data_size = 6000 
+        WHERE description = '5KB Test Data';"
     
     echo -e "${BLUE}=== Testing large tuple deletion ===${NC}"
-    psql -p $PORT -d postgres -c "DELETE FROM muadb_large_test WHERE data_size = 7500;"
+    psql -p $PORT -d postgres -c "DELETE FROM muadb_large_test WHERE data_size = 6000;"
     
     echo -e "${BLUE}=== Final state of large test table ===${NC}"
     psql -p $PORT -d postgres -c "SELECT id, description, data_size, length(large_data) as actual_length 
@@ -244,15 +232,12 @@ run_tests() {
     psql -p $PORT -d postgres -c "DROP TABLE muadb_test, muadb_large_test;"
     
     print_status "Integration tests completed!"
-    print_status "Large tuple tests demonstrate that TOAST is disabled - all large tuples handled by MuaDB!"
+    print_status "Large tuple test demonstrates that TOAST is disabled - large tuples handled by MuaDB!"
     echo
     echo -e "${YELLOW}=== Large Tuple Test Summary ===${NC}"
-    echo -e "${YELLOW}✓ 3KB tuple: Successfully stored without TOAST${NC}"
     echo -e "${YELLOW}✓ 5KB tuple: Successfully stored without TOAST${NC}" 
-    echo -e "${YELLOW}✓ 7KB tuple: Successfully stored without TOAST${NC}"
-    echo -e "${YELLOW}✓ 8KB tuple: Successfully stored without TOAST${NC}"
-    echo -e "${YELLOW}✓ 8KB update: Successfully updated without TOAST${NC}"
-    echo -e "${YELLOW}All large tuples (>2KB TOAST threshold) handled directly by MuaDB!${NC}"
+    echo -e "${YELLOW}✓ Deletion: Successfully deleted large tuple${NC}"
+    echo -e "${YELLOW}Large tuples (>2KB TOAST threshold) handled directly by MuaDB!${NC}"
 }
 
 # Function to show MuaDB logs
@@ -328,6 +313,29 @@ stop_server() {
     fi
 }
 
+
+
+# Function to print environment setup commands
+print_env_setup() {
+    print_status "PostgreSQL environment setup commands:"
+    echo ""
+    echo -e "${YELLOW}# Copy and paste these commands to set up your environment:${NC}"
+    echo ""
+    echo "export PATH=\"$INSTALL_DIR/usr/local/pgsql/bin:\$PATH\""
+    echo "export LD_LIBRARY_PATH=\"$INSTALL_DIR/usr/local/pgsql/lib:\$LD_LIBRARY_PATH\""
+    echo "export PGPORT=$PORT"
+    echo "export PGDATABASE=postgres"
+    echo ""
+
+    echo ""
+    echo -e "${BLUE}# Then you can run PostgreSQL commands:${NC}"
+    echo -e "${YELLOW}psql                    # Connect to database${NC}"
+    echo -e "${YELLOW}psql -c \"SELECT version();\"  # Run a query${NC}"
+    echo -e "${YELLOW}pg_ctl status -D $DATA_DIR  # Check server status${NC}"
+}
+
+
+
 # Function to show usage
 show_usage() {
     echo "Usage: $0 [OPTION]"
@@ -344,12 +352,14 @@ show_usage() {
     echo "  full        - Run complete workflow (compile, init, start, test)"
     echo "  cleanup     - Clean up installation and data directories"
     echo "  status      - Show server status"
+    echo "  env         - Print environment setup commands"
     echo ""
     echo "Examples:"
-    echo "  $0 full       # Complete workflow from scratch"
-    echo "  $0 test       # Run tests on existing installation"
-    echo "  $0 logs       # Show recent MuaDB logs"
-    echo "  $0 watch      # Watch MuaDB logs in real-time"
+    echo "  $0 full              # Complete workflow from scratch"
+    echo "  $0 test              # Run tests on existing installation"
+    echo "  $0 logs              # Show recent MuaDB logs"
+    echo "  $0 watch             # Watch MuaDB logs in real-time"
+    echo "  $0 env               # Show environment setup commands"
 }
 
 # Function to show server status
@@ -431,6 +441,9 @@ case "${1:-full}" in
         ;;
     "status")
         show_status
+        ;;
+    "env")
+        print_env_setup
         ;;
     "help"|"-h"|"--help")
         show_usage

@@ -65,24 +65,47 @@ static redisContext *
 muadb_connect_redis(void)
 {
 	redisContext *ctx;
+	redisReply *reply;
 	
-	if (muadb_redis_ctx != NULL && muadb_redis_ctx->err == 0)
-		return muadb_redis_ctx;
+	/* Check if existing connection is still valid */
+	if (muadb_redis_ctx != NULL) {
+		if (muadb_redis_ctx->err == 0) {
+			/* Test the connection with a PING command */
+			reply = redisCommand(muadb_redis_ctx, "PING");
+			if (reply != NULL && reply->type == REDIS_REPLY_STATUS && 
+				strcmp(reply->str, "PONG") == 0) {
+				freeReplyObject(reply);
+				return muadb_redis_ctx;
+			}
+			if (reply)
+				freeReplyObject(reply);
+		}
+		
+		/* Connection is bad, close it */
+		MUADB_LOG("MuaDB: Existing Redis connection is invalid, reconnecting");
+		redisFree(muadb_redis_ctx);
+		muadb_redis_ctx = NULL;
+	}
 	
 	/* Connect to Redis on localhost:6379 */
 	ctx = redisConnect("127.0.0.1", 6379);
-	if (ctx == NULL || ctx->err) {
-		if (ctx) {
-			MUADB_LOG("MuaDB Redis connection error: %s", ctx->errstr);
-			redisFree(ctx);
-		} else {
-			MUADB_LOG("MuaDB Redis connection error: can't allocate redis context");
-		}
+	if (ctx == NULL) {
+		MUADB_LOG("MuaDB Redis connection error: can't allocate redis context");
 		return NULL;
 	}
 	
+	if (ctx->err) {
+		MUADB_LOG("MuaDB Redis connection error: %s", ctx->errstr);
+		redisFree(ctx);
+		return NULL;
+	}
+	
+	/* Set a reasonable timeout (5 seconds) */
+	struct timeval timeout = { 5, 0 };
+	redisSetTimeout(ctx, timeout);
+	
 	muadb_redis_ctx = ctx;
-	MUADB_LOG("MuaDB: Successfully connected to Redis");
+	MUADB_LOG("MuaDB: Successfully connected to Redis at 127.0.0.1:6379");
 	return ctx;
 }
 
@@ -232,18 +255,7 @@ muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	bool shouldFree = true;
 	HeapTuple tuple;
 	Oid relation_oid;
-	static uint32 next_tuple_id = 1;
-
-	/* During bootstrap, just do a minimal insert without Redis */
-	// if (IsBootstrapProcessingMode())
-	// {
-	// 	/* For bootstrap, just set a fake TID and return */
-	// 	BlockNumber blocknum = 1;
-	// 	OffsetNumber offnum = 1;
-	// 	ItemPointerSet(&slot->tts_tid, blocknum, offnum);
-	// 	slot->tts_tableOid = RelationGetRelid(relation);
-	// 	return;
-	// }
+	static uint32 next_tuple_id = 1;  /* TODO: Make this persistent and per-relation */
 
 	MUADB_LOG("MuaDB: Inserting tuple into relation %s using Redis", 
 		 RelationGetRelationName(relation));
@@ -259,22 +271,28 @@ muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 
 	/* Get tuple data */
 	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
+	if (tuple == NULL) {
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("MuaDB: Failed to fetch tuple from slot")));
+		return;
+	}
+	
 	relation_oid = RelationGetRelid(relation);
 	
 	/* 
 	 * Create a unique key for this tuple: "muadb:table_oid:tuple_id"
-	 * In a real implementation, you might use a more sophisticated key scheme
+	 * We include the relation OID to ensure keys are unique across tables
 	 */
 	key_buffer = psprintf("muadb:%u:%u", relation_oid, next_tuple_id);
 	
 	/*
-	 * For simplicity, we'll store the tuple's raw data as binary.
-	 * In a real implementation, you'd probably want to serialize to JSON 
-	 * or a more structured format.
+	 * Store the tuple's raw data as binary in Redis.
+	 * We store both the tuple header and data for complete reconstruction.
 	 */
 	value_buffer = (char *) tuple->t_data;
 	
-	/* Store in Redis using SET command */
+	/* Store in Redis using SET command with binary-safe format */
 	reply = redisCommand(redis_ctx, "SET %s %b", key_buffer, 
 						 value_buffer, tuple->t_len);
 	
@@ -288,28 +306,30 @@ muadbam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 		pfree(key_buffer);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("MuaDB: Failed to store tuple in Redis")));
+				 errmsg("MuaDB: Redis SET command failed: %s", reply->str)));
 		return;
 	}
 	
-	MUADB_LOG("MuaDB: Successfully stored tuple with key '%s' in Redis", key_buffer);
+	MUADB_LOG("MuaDB: Successfully stored tuple with key '%s' in Redis (size: %u bytes)", 
+			 key_buffer, tuple->t_len);
 	
-	/* Generate a fake TID for the stored tuple */
+	/* Generate a TID for the stored tuple */
 	BlockNumber blocknum;
 	OffsetNumber offnum;
 	
+	/* Calculate block and offset from tuple ID */
 	blocknum = (next_tuple_id / MaxOffsetNumber) + 1;
 	offnum = (next_tuple_id % MaxOffsetNumber) + 1;
 	ItemPointerSet(&slot->tts_tid, blocknum, offnum);
 	
-	/* Set the table OID */
+	/* Set table OID in slot and tuple */
 	slot->tts_tableOid = relation_oid;
 	tuple->t_tableOid = relation_oid;
 	
 	/* Increment tuple ID for next insertion */
 	next_tuple_id++;
 	
-	/* Cleanup */
+	/* Clean up resources */
 	freeReplyObject(reply);
 	pfree(key_buffer);
 	if (shouldFree)
