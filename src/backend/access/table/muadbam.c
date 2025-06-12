@@ -112,23 +112,48 @@ static bool
 muadb_tuple_visible(TransactionId xid, Snapshot snapshot)
 {
 	/* If no snapshot, all committed tuples are visible */
-	if (snapshot == NULL)
+	if (snapshot == NULL) {
+		MUADB_LOG("MuaDB: No snapshot provided, checking if XID %u is committed or current", xid);
 		return TransactionIdDidCommit(xid) || TransactionIdIsCurrentTransactionId(xid);
+	}
+	
+	/* Handle invalid snapshots (xmin=0) - treat as no snapshot */
+	if (snapshot->xmin == InvalidTransactionId) {
+		MUADB_LOG("MuaDB: Invalid snapshot (xmin=0), checking if XID %u is committed or current", xid);
+		return TransactionIdDidCommit(xid) || TransactionIdIsCurrentTransactionId(xid);
+	}
+		
+	MUADB_LOG("MuaDB: Checking visibility of XID %u with snapshot (xmin=%u, xmax=%u, xcnt=%d)", 
+			 xid, snapshot->xmin, snapshot->xmax, snapshot->xcnt);
 		
 	/* Check if the transaction that created this version is visible */
 	if (TransactionIdIsCurrentTransactionId(xid)) {
-		/* Our own transaction - visible */
+		/* Our own transaction - always visible */
+		MUADB_LOG("MuaDB: XID %u is current transaction - visible", xid);
 		return true;
-	} else if (XidInMVCCSnapshot(xid, snapshot)) {
-		/* Transaction still running - not visible */
-		return false;
-	} else if (!TransactionIdDidCommit(xid)) {
-		/* Transaction aborted - not visible */
-		return false;
 	}
 	
-	/* Transaction committed and visible to snapshot */
-	return true;
+	/* For committed transactions, check if they're visible to our snapshot */
+	if (TransactionIdDidCommit(xid)) {
+		MUADB_LOG("MuaDB: XID %u is committed", xid);
+		/* If the transaction committed before our snapshot started, it's visible */
+		if (TransactionIdPrecedes(xid, snapshot->xmin)) {
+			MUADB_LOG("MuaDB: XID %u precedes snapshot xmin %u - visible", xid, snapshot->xmin);
+			return true;
+		}
+		/* If it's in our snapshot's active list, it was still running - not visible */
+		if (XidInMVCCSnapshot(xid, snapshot)) {
+			MUADB_LOG("MuaDB: XID %u is in snapshot active list - not visible", xid);
+			return false;
+		}
+		/* Otherwise, it committed after our snapshot started but isn't in active list - visible */
+		MUADB_LOG("MuaDB: XID %u committed after snapshot but not in active list - visible", xid);
+		return true;
+	}
+	
+	/* Transaction aborted or still running - not visible */
+	MUADB_LOG("MuaDB: XID %u is not committed - not visible", xid);
+	return false;
 }
 
 /*
@@ -749,6 +774,7 @@ muadbam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	uint32 tuple_id;
 	BlockNumber blocknum;
 	OffsetNumber offnum;
+	char *best_key;
 	
 	blocknum = ItemPointerGetBlockNumber(otid);
 	offnum = ItemPointerGetOffsetNumber(otid);
@@ -768,6 +794,33 @@ muadbam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 				 errmsg("MuaDB: Failed to connect to Redis server during update")));
 		return TM_Deleted;
 	}
+	
+	/* First, find the best visible version of the tuple */
+	best_key = muadb_find_best_tuple_version(redis_ctx, relation_oid, tuple_id, snapshot);
+	if (best_key == NULL) {
+		MUADB_LOG("MuaDB: No visible version found for tuple %u during update", tuple_id);
+		return TM_Deleted;
+	}
+	
+	/* Get the current version to verify it exists */
+	reply = redisCommand(redis_ctx, "GET %s", best_key);
+	if (reply == NULL || reply->type != REDIS_REPLY_STRING) {
+		MUADB_LOG("MuaDB: Failed to fetch current version during update");
+		if (reply) freeReplyObject(reply);
+		pfree(best_key);
+		return TM_Deleted;
+	}
+	
+	/* Check if it's a tombstone */
+	if (strcmp(reply->str, MUADB_TOMBSTONE_VALUE) == 0) {
+		MUADB_LOG("MuaDB: Tuple %u is deleted (tombstone)", tuple_id);
+		freeReplyObject(reply);
+		pfree(best_key);
+		return TM_Deleted;
+	}
+	
+	freeReplyObject(reply);
+	pfree(best_key);
 	
 	/* Get tuple data for the new version */
 	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
