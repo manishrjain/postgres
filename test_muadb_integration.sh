@@ -242,7 +242,7 @@ run_tests() {
 
 # Function to show MuaDB logs
 show_muadb_logs() {
-    print_status "Showing recent MuaDB integration logs..."
+    print_status "Showing recent MuaDB integration logs (last 1000 lines)..."
     echo -e "${BLUE}=== Recent MuaDB Logs ===${NC}"
     
     # Find the latest PostgreSQL log file
@@ -250,11 +250,14 @@ show_muadb_logs() {
     
     if [ -n "$LATEST_LOG" ] && [ -f "$LATEST_LOG" ]; then
         echo -e "${BLUE}Reading from: $LATEST_LOG${NC}"
-        grep "MuaDB:" "$LATEST_LOG" | tail -20 || echo "No MuaDB logs found in the current log file."
+        # Show last 1000 lines of the log file, then filter for MuaDB
+        tail -1000 "$LATEST_LOG" | grep "MuaDB:" || echo "No MuaDB logs found in the last 1000 lines."
     elif [ -d "$PG_LOG_DIR" ]; then
         echo -e "${BLUE}Searching all log files in: $PG_LOG_DIR${NC}"
-        find "$PG_LOG_DIR" -name "postgresql-*.log" -type f -exec grep -l "MuaDB:" {} \; | \
-        xargs grep "MuaDB:" | tail -20 || echo "No MuaDB logs found in any log files."
+        # Get all log files, sort by modification time, take the latest, show last 1000 lines
+        find "$PG_LOG_DIR" -name "postgresql-*.log" -type f -printf '%T@ %p\n' | \
+        sort -n | tail -1 | cut -d' ' -f2- | \
+        xargs tail -1000 | grep "MuaDB:" || echo "No MuaDB logs found in any log files."
     else
         print_warning "PostgreSQL log directory not found: $PG_LOG_DIR"
         print_warning "Server may not be initialized yet."

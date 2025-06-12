@@ -350,12 +350,20 @@ muadbam_scan_getnextslot(TableScanDesc scan, ScanDirection direction, TupleTable
 	offnum = (tuple_id % MaxOffsetNumber) + 1;
 	ItemPointerSet(&tuple_data.t_self, blocknum, offnum);
 	
-	/* Create a copy of the tuple data since Redis reply will be freed */
-	tuple = heap_copytuple(&tuple_data);
+	MUADB_LOG("MuaDB: Setting TID (%u,%u) for tuple_id %u from key %s", 
+			 blocknum, offnum, tuple_id, current_key);
 	
-	/* Store tuple in slot using the virtual tuple approach */
-	ExecForceStoreHeapTuple(tuple, slot, true); /* true = should free tuple */
+	/* Store tuple in slot - ExecForceStoreHeapTuple will make its own copy */
+	ExecForceStoreHeapTuple(&tuple_data, slot, false); /* false = don't free tuple_data */
 	slot->tts_tableOid = RelationGetRelid(scan->rs_rd);
+	
+	/* CRITICAL: ExecForceStoreHeapTuple overwrites TID, so we must set it AFTER */
+	ItemPointerSet(&slot->tts_tid, blocknum, offnum);
+	
+	/* Verify final TID in slot */
+	MUADB_LOG("MuaDB: Final slot TID is (%u,%u)", 
+			 ItemPointerGetBlockNumber(&slot->tts_tid),
+			 ItemPointerGetOffsetNumber(&slot->tts_tid));
 	
 	MUADB_LOG("MuaDB: Retrieved tuple with key %s, TID (%u,%u)", 
 			 current_key, blocknum, offnum);
@@ -513,20 +521,23 @@ muadbam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 	uint32 tuple_id;
 	BlockNumber blocknum;
 	OffsetNumber offnum;
+	int deleted_count;
+	
+	MUADB_LOG("MuaDB: *** DELETE FUNCTION ENTRY *** for relation %s", RelationGetRelationName(relation));
 	
 	blocknum = ItemPointerGetBlockNumber(tid);
 	offnum = ItemPointerGetOffsetNumber(tid);
 	
-	MUADB_LOG("MuaDB: Deleting tuple from relation %s at TID (%u,%u)", 
+	MUADB_LOG("MuaDB: *** DELETE FUNCTION CALLED *** for relation %s at TID (%u,%u)", 
 		 RelationGetRelationName(relation), blocknum, offnum);
+	MUADB_LOG("MuaDB: MaxOffsetNumber = %u, calculated tuple_id will be %u", 
+		 MaxOffsetNumber, ((blocknum - 1) * MaxOffsetNumber) + (offnum - 1));
 	
 	/* Connect to Redis */
 	redis_ctx = muadb_connect_redis();
 	if (redis_ctx == NULL) {
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("MuaDB: Failed to connect to Redis server")));
-		return TM_Deleted;
+		MUADB_LOG("MuaDB: Failed to connect to Redis server during delete");
+		return TM_Deleted; /* Indicate tuple was not found/deleted */
 	}
 	
 	/* Calculate the tuple ID from TID */
@@ -536,28 +547,50 @@ muadbam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 	/* Create the key to delete */
 	key_buffer = psprintf("muadb:%u:%u", relation_oid, tuple_id);
 	
+	MUADB_LOG("MuaDB: Attempting to delete Redis key '%s'", key_buffer);
+	
 	/* Delete from Redis using DEL command */
 	reply = redisCommand(redis_ctx, "DEL %s", key_buffer);
 	
-	if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
-		if (reply) {
-			MUADB_LOG("MuaDB Redis DEL error: %s", reply->str);
-			freeReplyObject(reply);
-		}
+	if (reply == NULL) {
+		MUADB_LOG("MuaDB: Redis DEL command returned NULL for key '%s'", key_buffer);
 		pfree(key_buffer);
-		ereport(ERROR,
-				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("MuaDB: Failed to delete tuple from Redis")));
-		return TM_Deleted;
+		return TM_Deleted; /* Indicate tuple was not found */
 	}
 	
-	MUADB_LOG("MuaDB: Successfully deleted tuple with key '%s' from Redis", key_buffer);
+	if (reply->type == REDIS_REPLY_ERROR) {
+		MUADB_LOG("MuaDB: Redis DEL error for key '%s': %s", key_buffer, reply->str);
+		freeReplyObject(reply);
+		pfree(key_buffer);
+		return TM_Deleted; /* Indicate tuple was not found */
+	}
+	
+	if (reply->type != REDIS_REPLY_INTEGER) {
+		MUADB_LOG("MuaDB: Redis DEL returned unexpected type %d for key '%s'", reply->type, key_buffer);
+		freeReplyObject(reply);
+		pfree(key_buffer);
+		return TM_Deleted; /* Indicate tuple was not found */
+	}
+	
+	/* Check how many keys were actually deleted */
+	deleted_count = reply->integer;
+	
+	if (deleted_count == 0) {
+		MUADB_LOG("MuaDB: Tuple with key '%s' was not found in Redis", key_buffer);
+		freeReplyObject(reply);
+		pfree(key_buffer);
+		return TM_Deleted; /* Tuple was not found */
+	}
+	
+	MUADB_LOG("MuaDB: Successfully deleted tuple with key '%s' from Redis (deleted %d keys)", 
+			 key_buffer, deleted_count);
 	
 	/* Cleanup */
 	freeReplyObject(reply);
 	pfree(key_buffer);
 	
-	return TM_Ok;
+	MUADB_LOG("MuaDB: *** DELETE FUNCTION EXIT SUCCESS ***");
+	return TM_Ok; /* Successfully deleted */
 }
 
 static TM_Result
@@ -712,15 +745,71 @@ muadbam_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
 static bool 
 muadbam_fetch_row_version(Relation relation, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
 {
-	const TableAmRoutine *heapam;
+	redisContext *redis_ctx;
+	redisReply *reply;
+	char *key_buffer;
+	Oid relation_oid;
+	uint32 tuple_id;
+	BlockNumber blocknum;
+	OffsetNumber offnum;
+	HeapTupleData tuple_data;
+	HeapTuple tuple;
 	
-	MUADB_LOG("MuaDB: Fetching row version from relation %s at TID (%u,%u)",
-		 RelationGetRelationName(relation),
-		 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
+	blocknum = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
 	
-	/* Get heap table access method and delegate */
-	heapam = GetHeapamTableAmRoutine();
-	return heapam->tuple_fetch_row_version(relation, tid, snapshot, slot);
+	MUADB_LOG("MuaDB: *** FETCH_ROW_VERSION CALLED *** for relation %s at TID (%u,%u)",
+		 RelationGetRelationName(relation), blocknum, offnum);
+	
+	/* Connect to Redis */
+	redis_ctx = muadb_connect_redis();
+	if (redis_ctx == NULL) {
+		MUADB_LOG("MuaDB: Failed to connect to Redis during fetch_row_version");
+		ExecClearTuple(slot);
+		return false;
+	}
+	
+	/* Calculate the tuple ID from TID */
+	tuple_id = ((blocknum - 1) * MaxOffsetNumber) + (offnum - 1);
+	relation_oid = RelationGetRelid(relation);
+	
+	/* Create the key to fetch */
+	key_buffer = psprintf("muadb:%u:%u", relation_oid, tuple_id);
+	
+	MUADB_LOG("MuaDB: Fetching Redis key '%s' for row version", key_buffer);
+	
+	/* Retrieve tuple data from Redis */
+	reply = redisCommand(redis_ctx, "GET %s", key_buffer);
+	
+	if (reply == NULL || reply->type != REDIS_REPLY_STRING) {
+		MUADB_LOG("MuaDB: Tuple with key '%s' not found in Redis", key_buffer);
+		if (reply)
+			freeReplyObject(reply);
+		pfree(key_buffer);
+		ExecClearTuple(slot);
+		return false; /* Tuple not found */
+	}
+	
+	/* Reconstruct HeapTuple from Redis data */
+	tuple_data.t_len = reply->len;
+	tuple_data.t_data = (HeapTupleHeader) reply->str;
+	tuple_data.t_tableOid = RelationGetRelid(relation);
+	ItemPointerCopy(tid, &tuple_data.t_self);
+	
+	/* Create a copy of the tuple data since Redis reply will be freed */
+	tuple = heap_copytuple(&tuple_data);
+	
+	/* Store tuple in slot */
+	ExecForceStoreHeapTuple(tuple, slot, true); /* true = should free tuple */
+	slot->tts_tableOid = RelationGetRelid(relation);
+	
+	MUADB_LOG("MuaDB: Successfully fetched row version with key '%s'", key_buffer);
+	
+	/* Clean up */
+	freeReplyObject(reply);
+	pfree(key_buffer);
+	
+	return true; /* Successfully fetched */
 }
 
 static void 
